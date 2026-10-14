@@ -319,6 +319,10 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
+
+        print(f"\n[DEBUG] 尝试请求 URL: {url}")
+       
+
         r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
@@ -352,6 +356,8 @@ def check_one(node, session):
             out["residential"] = classify_network(out["host"], None, None)
         return out
     except Exception as exc:
+        print(f"[DEBUG] 发生异常: {type(exc).__name__}: {exc}") 
+        out["error"] = f"{type(exc).__name__}: {exc}"
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
         return out
