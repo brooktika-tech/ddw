@@ -480,7 +480,9 @@ EDGE_HOSTS = [
 "chrono24.com:443,hubspot.com:443,hsl.upstate.edu:443,absen.com:443,themeisle.com:443,"
 "www.mediafire.com:443,i.pixiv.re:443,pubs.acs.org:443,cdn.tzpro.xyz:443,gitlab.com:443,"
 "store.rg-adguard.net:443,99.co:443,iskills.com:443,hostinger.com:443,s.ee:443,"
-"dango.co:443,rargb.to:443,www.visa.com.hk:443,www.4429.com.cn:443",
+"dango.co:443,rargb.to:443,www.visa.com.hk:443,www.4429.com.cn:443"
+      "saas.072159.xyz:443,hzytjy.cn:443,ali.nonull.pp.ua:443,auto.dolby.dpdns.org:443,"
+        "cdn.cnno.de:443,saas.sin.fan:443,cf.777791.xyz:443",
     ).split(",")
     if h.strip()
 ]
