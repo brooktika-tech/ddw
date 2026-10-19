@@ -308,29 +308,10 @@ def classify_network(host, exit_org, is_datacenter=None):
 
 
 def check_one(node, session):
-  
-    # ... 拼接 url 的代码 ...
+    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。"""
+    base_url = "https://white-glitter-fb99.tmpbooktik.workers.dev/check"
+    url = f"{base_url}?proxyip={quote(f"{node['host']}:{node['port']}", safe='')}"
     
-    # 加上伪装头
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    
-    try:
-        # 带上 headers
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers=headers)
-        if r.status_code != 200:
-            # 打印出来，方便看是不是被 403 拦截了
-            print(f"[{node['host']}] 请求失败, 状态码: {r.status_code}")
-            out["error"] = f"HTTP {r.status_code}"
-            out["worker_error"] = True
-            return out
-        # ... 后面解析 JSON 的代码保持不变 ...
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
-    单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    # 注意这里有 & 或者 ? 区分，如果是第一个参数用 ?，后面追加用 &
-    url = f"{WORKER_CHECK_URL}?proxyip={quote(f"{node['host']}:{node['port']}", safe='')}"
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -338,12 +319,21 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    
+    # 注意：从这里开始，下面所有的代码都必须缩进（通常是 4 个空格）
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(url, timeout=CHECK_TIMEOUT, headers=headers)
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
+            print(f"[{node['host']}] 请求失败, HTTP 状态码: {r.status_code}")
             return out
+            
         j = r.json()
         ok = bool(j.get("success"))
         out["success"] = ok
@@ -351,7 +341,7 @@ def check_one(node, session):
         out["latency_ms"] = j.get("responseTime")
         out["colo"] = j.get("colo")
         out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
+        
         exit_info = j.get("exit") or {}
         if exit_info:
             asn = exit_info.get("asn") or {}
@@ -371,11 +361,12 @@ def check_one(node, session):
         else:
             out["residential"] = classify_network(out["host"], None, None)
         return out
+        
+    # 这里必须有 except，才能和上面的 try 配对！
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
         return out
-
 
 def check_all(nodes, session):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
