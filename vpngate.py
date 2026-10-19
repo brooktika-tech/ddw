@@ -570,22 +570,26 @@ def build_sub_text(data):
                 n.get("host") or "",
             ),
         )
-        for i, n in enumerate(nodes, 1):
+               for i, n in enumerate(nodes, 1):
             name = f"{zh}-{i:02d}"
+            
+            my_uuid = "64c2b3e8-0b57-4f35-91e8-dfc026820628"
+            my_domain = "white-glitter-fb99.tmpbooktik.workers.dev"
+            
             chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
             chain_json = json.dumps(chain, separators=(",", ":"))
-            enc = _b64_secret_encode(chain_json, EDT_UUID)
+            enc = _b64_secret_encode(chain_json, my_uuid)
             path = quote("/video/" + enc, safe="")
-                       
-            safe_uuid = str(EDT_UUID)
-            safe_domain = str(EDT_DOMAIN)
+            
             
             link = (
-                f"vless://{safe_uuid}@{safe_domain}:443?security=tls&type=ws"
-                f"&host={safe_domain}&fp={EDT_FINGERPRINT}&sni={safe_domain}"
+                f"vless://{my_uuid}@{my_domain}:443?security=tls&type=ws"
+                f"&host={my_domain}&fp=chrome&sni={my_domain}"
                 f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
             )
+                 
             lines.append(link)
+                 
     return "\n".join(lines) + "\n"
 
 def write_outputs(data):
