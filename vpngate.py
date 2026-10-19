@@ -583,7 +583,7 @@ def build_sub_text(data):
             link = (
                 f"vless://{my_uuid}@{my_domain}:443?security=tls&type=ws"
                 f"&host={my_domain}&fp=chrome&sni={my_domain}"
-                f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
+                f"&path={path}&encryption=none#{quote(name, safe='')}"
             )
             lines.append(link)
                  
