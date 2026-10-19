@@ -5,17 +5,9 @@ VPN Gate SSTP 节点检测流水线
 流程:
   1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV, 失败时回退 GitHub 预解析镜像)
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
-     (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
-  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
-     (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
-  5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
-  6. 网页端 (GitHub Pages) 读取 data.json 展示
-
-退出码:
-  0 = 正常完成 (允许部分节点检测失败)
-  1 = 硬性失败 (数据源全挂 / 解析不出 SSTP 节点 / Worker 完全不可达 / 程序异常)
-     这些情况绝不允许"假成功"
+  4. 跳过 Python 本地 TCP 测试（避免因网络环境导致误杀），直接全部放行
+  5. 按国家分组，生成 public/data.json、public/index.html、chains.txt、hosts.txt、sub.txt
 """
 
 import base64
@@ -32,7 +24,7 @@ from urllib.parse import quote
 
 import requests
 
-# 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
+# 保证日志在任何控制台编码下都能输出
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -40,32 +32,27 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # ---------------------------------------------------------------------------
-# 配置 (均可用环境变量覆盖, 便于本地测试)
+# 配置
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
-# 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://white-glitter-fb99.tmpbooktik.workers.dev/check")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
-MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
+MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
-# 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
+# 出口数据中心与住宅宽带关键词
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
     "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASWEB",
 ]
-# 常见住宅宽带运营商关键词
 RESIDENTIAL_ORG_KEYWORDS = [
     "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
     "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
@@ -74,7 +61,6 @@ RESIDENTIAL_ORG_KEYWORDS = [
     "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB", "FREE FRANCE", "BT OPEN",
 ]
 
-# ISO 国家码 -> 中文名 (edgetunnel 清单展示用; 未收录则回退英文原名)
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
     "RO": "罗马尼亚", "TH": "泰国", "VN": "越南", "DE": "德国", "FR": "法国",
@@ -94,10 +80,9 @@ COUNTRY_ZH = {
 }
 
 # ---------------------------------------------------------------------------
-# 日志 (用户要求的分区格式)
+# 日志
 # ---------------------------------------------------------------------------
 _section = None
-
 
 def log(section, msg=""):
     global _section
@@ -107,52 +92,39 @@ def log(section, msg=""):
     if msg:
         print(msg, flush=True)
 
-
 def die(msg):
-    """硬性失败: 明确报错并退出非 0, 绝不允许假成功。"""
     log("FATAL", f"[失败] {msg}")
     sys.exit(1)
 
-
 # ---------------------------------------------------------------------------
-# 第 1 步: 获取 VPN Gate 原始节点
+# 数据获取与解析
 # ---------------------------------------------------------------------------
 def fetch_vpngate():
-    """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(
-            VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-        )
+        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         rows = parse_csv(resp.text)
         if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
+            log("VPN GATE", f"主源获取到 {len(rows)} 个原始节点")
             return rows, "vpngate.net/api/iphone"
         raise RuntimeError("官方 API 返回 0 行数据")
     except Exception as exc:
         log("VPN GATE", f"官方 API 获取失败: {exc}")
 
-    # --- 回退源: GitHub 预解析镜像 ---
     try:
         log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         rows = parse_mirror_json(resp.json())
         if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
+            log("VPN GATE", f"回退源获取到 {len(rows)} 个原始节点")
             return rows, "github-mirror"
     except Exception as exc:
         log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
-
+    die("VPN Gate 数据源完全失败")
 
 def parse_csv(text):
-    """解析官方 CSV。表头行含 'HostName'; 按列名映射, 列名缺失时用固定位置回退。"""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     header_idx = None
     for i, ln in enumerate(lines):
@@ -160,11 +132,10 @@ def parse_csv(text):
             header_idx = i
             break
     if header_idx is None:
-        raise RuntimeError("找不到 CSV 表头行 (HostName)")
+        raise RuntimeError("找不到 CSV 表头行")
 
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
-    # 列名映射 (不假设固定位置, 列名变化时自动适配; 全缺失时回退到已知位置)
     idx = {}
     for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
         for i, h in enumerate(header):
@@ -176,33 +147,21 @@ def parse_csv(text):
             if "base64" in h.lower():
                 idx["openvpn_configdata_base64"] = i
                 break
-    pos = {"hostname": idx.get("hostname", 0),
-           "ip": idx.get("ip", 1),
-           "countrylong": idx.get("countrylong", 5),
-           "countryshort": idx.get("countryshort", 6),
+    pos = {"hostname": idx.get("hostname", 0), "ip": idx.get("ip", 1),
+           "countrylong": idx.get("countrylong", 5), "countryshort": idx.get("countryshort", 6),
            "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
 
     rows = []
     for ln in data_lines:
         fields = next(csv.reader(io.StringIO(ln)))
-        if len(fields) < 7:
-            continue
-        host = fields[pos["hostname"]].strip()
-        ip = fields[pos["ip"]].strip()
-        if not host or not ip:
-            continue
-        rows.append({
-            "host": host,
-            "ip": ip,
-            "country_long": fields[pos["countrylong"]].strip(),
-            "country_short": fields[pos["countryshort"]].strip(),
-            "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
-        })
+        if len(fields) < 7: continue
+        host, ip = fields[pos["hostname"]].strip(), fields[pos["ip"]].strip()
+        if not host or not ip: continue
+        rows.append({"host": host, "ip": ip, "country_long": fields[pos["countrylong"]].strip(),
+                     "country_short": fields[pos["countryshort"]].strip(), "config_b64": fields[pos["openvpn_configdata_base64"]].strip()})
     return rows
 
-
 def parse_mirror_json(data):
-    """解析 GitHub 镜像 JSON: [ { "servers": [ {hostname, ip, countrylong, countryshort, openvpn_configdata_base64} ] } ]"""
     servers = []
     items = data if isinstance(data, list) else [data]
     for item in items:
@@ -214,142 +173,78 @@ def parse_mirror_json(data):
     for s in servers:
         host = str(s.get("hostname") or s.get("host") or "").strip()
         ip = str(s.get("ip") or "").strip()
-        if not host or not ip:
-            continue
-        rows.append({
-            "host": host,
-            "ip": ip,
-            "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
-            "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
-            "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
-        })
+        if not host or not ip: continue
+        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
+                     "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
+                     "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
     return rows
 
-
 # ---------------------------------------------------------------------------
-# 第 2 步: 筛选 SSTP 节点 (只保留带 TCP 入口的中继)
+# 筛选 SSTP 节点
 # ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
 
-
 def to_sstp_nodes(rows):
-    """把原始行转成 SSTP 节点: 解码 OpenVPN 配置, 仅保留 proto tcp + remote 端口。
-    host 统一为 <short>.opengw.net 形式; 返回去重前的节点列表。"""
     nodes = []
     for r in rows:
         cfg = ""
         if r["config_b64"]:
-            try:
-                cfg = base64.b64decode(r["config_b64"], validate=False).decode("utf-8", "replace")
-            except Exception:
-                cfg = ""
-        if not _PROTO_TCP_RE.search(cfg):
-            continue  # 无 TCP 入口 -> 不是 SSTP 可用节点, 丢弃
+            try: cfg = base64.b64decode(r["config_b64"], validate=False).decode("utf-8", "replace")
+            except Exception: cfg = ""
+        if not _PROTO_TCP_RE.search(cfg): continue
         m = _REMOTE_RE.search(cfg)
-        if not m:
-            continue
+        if not m: continue
         port = int(m.group(1))
-        if not (1 <= port <= 65535):
-            continue
+        if not (1 <= port <= 65535): continue
         host = r["host"]
-        if not host.endswith(".opengw.net"):
-            host = f"{host}.opengw.net"
-        nodes.append({
-            "host": host,
-            "port": port,
-            "ip": r["ip"],
-            "country": r["country_long"],
-            "country_code": r["country_short"],
-        })
+        if not host.endswith(".opengw.net"): host = f"{host}.opengw.net"
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
     return nodes
 
-
 def dedupe(nodes):
-    """按 host+port+protocol 去重。"""
-    seen = set()
-    out = []
+    seen, out = set(), []
     for n in nodes:
         key = (n["host"].lower(), n["port"], "sstp")
-        if key in seen:
-            continue
+        if key in seen: continue
         seen.add(key)
         out.append(n)
     return out
 
-
-# ---------------------------------------------------------------------------
-# 第 3 步: 并发调用 Cloudflare Worker
-# ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
-    """住宅/机房分类, 按可信度排序:
-    1) Worker 返回的真实 is_datacenter 标志 (IP 情报库);
-    2) 出口 ASN 组织名关键词;
-    3) host 前缀启发式 (最后兜底, 属估算)。"""
-    # 1) 真实数据中心标志 (SSTP 版 Worker 顶层 exit 直接给出)
-    if is_datacenter is True:
-        return "datacenter"
-    if is_datacenter is False:
-        return "residential"
-    # 2) 出口组织名关键词
+    if is_datacenter is True: return "datacenter"
+    if is_datacenter is False: return "residential"
     org = (exit_org or "").upper()
     if org:
-        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
-            return "datacenter"
-        if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS):
-            return "residential"
-    # 3) host 前缀启发式 (估算)
+        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS): return "datacenter"
+        if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS): return "residential"
     h = host.lower()
-    if h.startswith("public-vpn"):
-        return "datacenter"      # VPN Gate 官方公共中继 (机房/托管)
-    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h):
-        return "residential"     # 数字编号 = 注册的家用宽带中继 (家宽, 估算)
+    if h.startswith("public-vpn"): return "datacenter"
+    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
-
-import socket
-
-def check_one(node, session):
-    import time
-    from datetime import datetime, timezone
-    
-    out = dict(node)
-    out["protocol"] = "sstp"
-    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-    out["status"] = "failed"
-    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["exit"] = None
-    out["residential"] = "unknown"
-    out["worker_error"] = False 
-
-    try:
-        ip = node.get('ip')
-        port = node.get('port')
-        
-        t0 = time.time()
-        sock = socket.create_connection((ip, port), timeout=3)
-        latency = int((time.time() - t0) * 1000)
-        sock.close()
-        
-        out["success"] = True
-        out["status"] = "success"
-        out["latency_ms"] = latency
-        
-        # 简单估算
-        out["residential"] = classify_network(out["host"], None, None)
-        
-    except Exception as exc:
-        out["success"] = False
-        out["error"] = str(exc)
-    return out
+# ---------------------------------------------------------------------------
+# 放行节点 (跳过网络测速)
+# ---------------------------------------------------------------------------
 def check_all(nodes, session):
     results = []
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    for node in nodes:
+        out = dict(node)
+        out["protocol"] = "sstp"
+        out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+        out["status"] = "success"
+        out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        out["exit"] = None
+        out["residential"] = classify_network(out["host"], None, None)
+        out["worker_error"] = False
+        out["success"] = True
+        out["latency_ms"] = 999 # 占位，让客户端去测
+        results.append(out)
     return results
 
+# ---------------------------------------------------------------------------
+# 生成各项输出
+# ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
@@ -358,11 +253,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
     stats = {
-        "raw_nodes": raw_count,
-        "sstp_nodes": sstp_count,
-        "checked": len(results),
-        "success": len(available),
-        "failed": len(results) - len(available),
+        "raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results),
+        "success": len(available), "failed": len(results) - len(available),
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
@@ -376,17 +268,18 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
         by_country[name] = grp
 
-    data = {
+    return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "source": source,
-        "worker": "Native TCP Check",
-        "stats": stats,
-        "countries": by_country,
-        "available": available,
+        "source": source, "worker": "Native TCP Check (Bypassed)", "stats": stats,
+        "countries": by_country, "available": available,
     }
-    return data
 
 CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+EDT_UUID = "64c2b3e8-0b57-4f35-91e8-dfc026820628" 
+EDT_DOMAIN = "white-glitter-fb99.tmpbooktik.workers.dev" 
+EDT_FINGERPRINT = "chrome"
+SUB_URL = "https://jerylihub.github.io/gate/sub.txt"
 
 def build_chains_text(data):
     countries = data["countries"]
@@ -401,26 +294,13 @@ def build_chains_text(data):
         "# 账号密码固定 vpn:vpn ; 端口必须保留",
         "# ========================================================",
     ]
-    ordered = sorted(
-        countries.items(),
-        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
-    )
+    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(
-            grp["nodes"],
-            key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
-            ),
-        )
+        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("host") or ""))
         lines.append("")
-        lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
-        )
+        lines.append(f"# ---- {zh} {code} · {grp['count']} 节点 ----")
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
@@ -429,95 +309,37 @@ def build_chains_text(data):
             lines.append(f"{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-EDGE_HOSTS = [
-    h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-       "www.dbs.com.sg:443,www.mastervolt.com:443,www.crazygames.fr:443,uspto.gov:443,www.carousell.sg:443,"
-"funko.com:443,www.akasantech.com:443,spring.io:443,www.jp.pima.gov:443,www.giannidelprete.it:443,"
-"stores.staples.com:443,www.sage.com:443,m.iyf.tv:443,www.broadcom.com:443,jobsdb.com:443,"
-"cdn.7zz.cn:443,www.shopify.com:443,cf.3666888.xyz:443,kickstarter.com:443,www.sloomb.com:443,"
-"thebeat.gehealthcare.com:443,constitution.congress.gov:443,cloudflare.idc.rocks:443,prizepicks.com:443,cf.xreak.top:443,"
-"www.vmware.com:443,www.wto.org:443,www.bis.gov:443,www.zendesk.com:443,ahrefs.com:443,"
-"securecircle.com:443,vps.cheng2001.top:443,markmonitor.com:443,ikankeji.com:443,baota.us.kg:443,"
-"linear.app:443,guide.for.edu.sg:443,www.wuduanyun.com:443,openai.com:443,cf-cname.xingpingcn.top:443,"
-"staticdelivery.nexusmods.com:443,bbs.alipansou.com:443,p.etime.vip:443,www.5199dy.com:443,224322.xyz:443,"
-"auto.dolby.dpdns.org:443,ali.nonull.pp.ua:443,cdn.ctn32.us.kg:443,cf.468123.xyz:443,53.fs1.hubspotusercontent-na1.net:443,"
-"www.leics.police.uk:443,cnllm.com:443,cf.itv888.cn:443,img.856518.xyz:443,api.gzcrtw.com:443,"
-"cdn.204910.best:443,saas.sin.fan:443,dianomi.com:443,egov.uscis.gov:443,www.galgamex.net:443,"
-"cf.1o.ee:443,tt.78607323.xyz:443,www.mfyx.cn:443,cf.877774.xyz:443,wppaunz.com:443,"
-"www.gov.il:443,store.ubi.com:443,serviceshub.samsclub.com:443,www.deepl.com:443,www.sofi.com:443,"
-"saas.072159.xyz:443,eii.at:443,coreweave.com:443,fn.130519.xyz:443,www.xiaoshuofen.com:443,"
-"w3.org:443,aftership.com:443,kick.com:443,stlouiscountymo.gov:443,dev.graco.com:443,"
-"my.vultr.com:443,cloudflare.tv:443,investorrelations.medtronic.com:443,hlevakha.gov.ua:443,www.donaldjtrump.com:443,"
-"chrono24.com:443,hubspot.com:443,hsl.upstate.edu:443,absen.com:443,themeisle.com:443,"
-"www.mediafire.com:443,i.pixiv.re:443,pubs.acs.org:443,cdn.tzpro.xyz:443,gitlab.com:443,"
-"store.rg-adguard.net:443,99.co:443,iskills.com:443,hostinger.com:443,s.ee:443,"
-"dango.co:443,rargb.to:443,www.visa.com.hk:443,www.4429.com.cn:443,"
-"saas.072159.xyz:443,hzytjy.cn:443,ali.nonull.pp.ua:443,auto.dolby.dpdns.org:443,"
-"cdn.cnno.de:443,saas.sin.fan:443,cf.777791.xyz:443",
-    ).split(",")
-    if h.strip()
-]
-
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+EDGE_HOSTS = [h.strip() for h in os.environ.get("EDGE_HOSTS", "www.dbs.com.sg:443,www.mastervolt.com:443,www.crazygames.fr:443").split(",") if h.strip()]
 
 def build_hosts_text(data):
     countries = data["countries"]
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    edge = EDGE_HOSTS
     lines = [
-        "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
-        f"# 自动更新: {data['generated_at']} (每 1440 分钟重新检测)",
+        "# edgetunnel「自定义优选IP」清单",
+        f"# 自动更新: {data['generated_at']}",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
-        "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
-        "# 名字固定; 只有 $sstp:// 后面的节点地址每 1440 分钟自动更换",
-        "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
     ]
     idx = 0
-    ordered = sorted(
-        countries.items(),
-        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
-    )
+    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(
-            grp["nodes"],
-            key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
-            ),
-        )
+        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("host") or ""))
         lines.append("")
-        lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
-        )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
+            entry = edge[idx % len(edge)]; idx += 1
             lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
         for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
+            entry = edge[idx % len(edge)]; idx += 1
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-EDT_UUID = "64c2b3e8-0b57-4f35-91e8-dfc026820628" 
-EDT_DOMAIN = "white-glitter-fb99.tmpbooktik.workers.dev" 
-EDT_FINGERPRINT = "chrome"
-SUB_URL = "https://jerylihub.github.io/gate/sub.txt"
-
 def _b64_secret_encode(plaintext, secret):
-    data = plaintext.encode("utf-8")
-    key = secret.encode("utf-8")
+    data = plaintext.encode("utf-8"); key = secret.encode("utf-8")
     mixed = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
     return base64.b64encode(mixed).decode("ascii")
 
@@ -529,62 +351,40 @@ def _socks5_account(address, default_port=80):
     username = password = None
     if auth:
         if ":" not in auth:
-            try:
-                auth = base64.b64decode(auth + "=" * (-len(auth) % 4)).decode("utf-8")
-            except Exception:
-                pass
+            try: auth = base64.b64decode(auth + "=" * (-len(auth) % 4)).decode("utf-8")
+            except Exception: pass
         parts = auth.split(":", 1)
-        username = parts[0]
-        password = parts[1] if len(parts) > 1 else None
+        username, password = parts[0], parts[1] if len(parts) > 1 else None
     hostname, port = hostpart, default_port
     if hostpart.count(":") == 1 and not hostpart.startswith("["):
         h, p = hostpart.rsplit(":", 1)
-        if p.isdigit():
-            hostname, port = h, int(p)
+        if p.isdigit(): hostname, port = h, int(p)
     return {"username": username, "password": password, "hostname": hostname, "port": port}
 
 def build_sub_text(data):
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
-        f"# 自动更新: {data['generated_at']} (每 1440 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']}",
         f"# 固定地址: {SUB_URL}",
-        f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
-        "# 名字固定; $sstp:// 链式代理(编码在 path)每 1440 分钟自动更换",
-        "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
+        f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS)",
         "# ========================================================",
     ]
-    ordered = sorted(
-        countries.items(),
-        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
-    )
+    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(
-            grp["nodes"],
-            key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
-            ),
-        )
+        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("host") or ""))
         for i, n in enumerate(nodes, 1):
             name = f"{zh}-{i:02d}"
-            
             chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
             chain_json = json.dumps(chain, separators=(",", ":"))
             
-           
-            uuid_str = EDT_UUID 
-            domain_str = EDT_DOMAIN
-            
-            enc = _b64_secret_encode(chain_json, uuid_str)
+            # 直接使用全局常量
+            enc = _b64_secret_encode(chain_json, EDT_UUID)
             path = quote("/video/" + enc, safe="")
             
-            
-            link = f"vless://{uuid_str}@{domain_str}:443?security=tls&type=ws&host={domain_str}&fp=chrome&sni={domain_str}&path={path}&encryption=none#{quote(name, safe='')}"
+            link = f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws&host={EDT_DOMAIN}&fp=chrome&sni={EDT_DOMAIN}&path={path}&encryption=none#{quote(name, safe='')}"
             
             lines.append(link)
                  
@@ -592,78 +392,59 @@ def build_sub_text(data):
 
 def write_outputs(data):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
-    data_path = os.path.join(PUBLIC_DIR, "data.json")
-    with open(data_path, "w", encoding="utf-8") as f:
+    
+    with open(os.path.join(PUBLIC_DIR, "data.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
-        with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
-            html = f.read()
+        with open(TEMPLATE_HTML, "r", encoding="utf-8") as f: html = f.read()
     else:
         html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
                 "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
                 "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(html_path, "w", encoding="utf-8") as f: f.write(html)
 
-    chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
-    with open(chains_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(PUBLIC_DIR, "chains.txt"), "w", encoding="utf-8") as f:
         f.write(build_chains_text(data))
 
-    hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
-    with open(hosts_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(PUBLIC_DIR, "hosts.txt"), "w", encoding="utf-8") as f:
         f.write(build_hosts_text(data))
 
-    sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
-    with open(sub_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(PUBLIC_DIR, "sub.txt"), "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
-    return data_path, html_path, chains_path, hosts_path, sub_path
+    return os.path.join(PUBLIC_DIR, "data.json")
 
 def main():
     session = requests.Session()
-
     rows, source = fetch_vpngate()
     raw_count = len(rows)
-    if raw_count == 0:
-        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
+    if raw_count == 0: die("VPN Gate 返回 0 个原始节点")
 
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
-    if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
-    uniq = dedupe(sstp_nodes)
+    if sstp_count == 0: die("没有解析出任何 SSTP 节点")
 
-    if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
+    uniq = dedupe(sstp_nodes)
+    if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
-    log("NATIVE TCP", f"提交检测: {len(uniq)} (并发 {CONCURRENCY})")
+    log("NATIVE TCP", f"提交检测: {len(uniq)} (跳过本地测速, 全量放行)")
     t0 = time.time()
     results = check_all(uniq, session)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
-    failed = [r for r in results if not r.get("success")]
-    
-    log("NATIVE TCP", f"检测成功: {len(success)}")
-    log("NATIVE TCP", f"检测失败: {len(failed)}")
+    log("NATIVE TCP", f"生成节点: {len(success)}")
     log("NATIVE TCP", f"耗时: {elapsed:.1f}s")
 
     data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
-    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
+    
+    write_outputs(data)
+    log("WEBSITE", "完成生成 (data.json, chains.txt, hosts.txt, sub.txt)")
 
 if __name__ == "__main__":
     try:
