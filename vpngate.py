@@ -561,7 +561,7 @@ def build_sub_text(data):
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(
+            nodes = sorted(
             grp["nodes"],
             key=lambda n: (
                 0 if n.get("residential") == "residential" else 1,
@@ -570,7 +570,7 @@ def build_sub_text(data):
                 n.get("host") or "",
             ),
         )
-               for i, n in enumerate(nodes, 1):
+            for i, n in enumerate(nodes, 1):
             name = f"{zh}-{i:02d}"
             
             my_uuid = "64c2b3e8-0b57-4f35-91e8-dfc026820628"
