@@ -343,8 +343,7 @@ def check_one(node, session):
         out["error"] = str(exc)
 
     return out
-        
-   def check_all(nodes, session):
+  def check_all(nodes, session):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
