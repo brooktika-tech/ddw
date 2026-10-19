@@ -576,9 +576,13 @@ def build_sub_text(data):
             chain_json = json.dumps(chain, separators=(",", ":"))
             enc = _b64_secret_encode(chain_json, EDT_UUID)
             path = quote("/video/" + enc, safe="")
+                       
+            safe_uuid = str(EDT_UUID)
+            safe_domain = str(EDT_DOMAIN)
+            
             link = (
-                f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
-                f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
+                f"vless://{safe_uuid}@{safe_domain}:443?security=tls&type=ws"
+                f"&host={safe_domain}&fp={EDT_FINGERPRINT}&sni={safe_domain}"
                 f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
             )
             lines.append(link)
