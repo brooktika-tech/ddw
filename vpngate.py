@@ -364,11 +364,12 @@ def check_one(node, session):
         return out
         
     # 这里必须有 except，才能和上面的 try 配对！
-    except Exception as exc:
+       except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
+        # 👇 加上这一行，强制在日志里打印出具体的报错信息 👇
+        print(f"❌ 请求 [{node['host']}:{node['port']}] 失败，原因: {out['error']}")
         return out
-
 def check_all(nodes, session):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
