@@ -572,17 +572,17 @@ def build_sub_text(data):
         )
         for i, n in enumerate(nodes, 1):
             name = f"{zh}-{i:02d}"
-            my_uuid = "64c2b3e8-0b57-4f35-91e8-dfc026820628"
-            my_domain = "white-glitter-fb99.tmpbooktik.workers.dev"
-
+            
+            # 直接使用全局常量，不自己新建变量，防止冲突
             chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
             chain_json = json.dumps(chain, separators=(",", ":"))
-            enc = _b64_secret_encode(chain_json, my_uuid)
+            enc = _b64_secret_encode(chain_json, EDT_UUID)
             path = quote("/video/" + enc, safe="")
-
+            
+            # 使用全局常量拼装 URL
             link = (
-                f"vless://{my_uuid}@{my_domain}:443?security=tls&type=ws"
-                f"&host={my_domain}&fp=chrome&sni={my_domain}"
+                f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
+                f"&host={EDT_DOMAIN}&fp=chrome&sni={EDT_DOMAIN}"
                 f"&path={path}&encryption=none#{quote(name, safe='')}"
             )
             lines.append(link)
