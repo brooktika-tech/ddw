@@ -510,10 +510,10 @@ def build_hosts_text(data):
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-EDT_UUID = os.environ.get("EDT_UUID", "64c2b3e8-0b57-4f35-91e8-dfc026820628")
-EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "uuu.yttreee.kdns.fr")
-EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+EDT_UUID = "64c2b3e8-0b57-4f35-91e8-dfc026820628" 
+EDT_DOMAIN = "white-glitter-fb99.tmpbooktik.workers.dev" 
+EDT_FINGERPRINT = "chrome"
+SUB_URL = "https://jerylihub.github.io/gate/sub.txt"
 
 def _b64_secret_encode(plaintext, secret):
     data = plaintext.encode("utf-8")
