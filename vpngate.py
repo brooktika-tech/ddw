@@ -307,11 +307,11 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
+import socket
+
 def check_one(node, session):
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。"""
-    base_url = "https://white-glitter-fb99.tmpbooktik.workers.dev/check"
-    proxy_addr = node['host'] + ":" + str(node['port'])
-    url = f"{base_url}?proxyip={quote(proxy_addr, safe='')}"
+    import time
+    from datetime import datetime, timezone
     
     out = dict(node)
     out["protocol"] = "sstp"
@@ -320,48 +320,29 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    
-    # 注意：从这里开始，下面所有的代码都必须缩进（通常是 4 个空格）
+    out["worker_error"] = False 
+
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers=headers)
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
-            out["worker_error"] = True
-            print(f"[{node['host']}] 请求失败, HTTP 状态码: {r.status_code}")
-            return out
-            
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
+        ip = node.get('ip')
+        port = node.get('port')
         
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
+        t0 = time.time()
+        sock = socket.create_connection((ip, port), timeout=3)
+        latency = int((time.time() - t0) * 1000)
+        sock.close()
+        
+        out["success"] = True
+        out["status"] = "success"
+        out["latency_ms"] = latency
+        
+        # 简单估算
+        out["residential"] = classify_network(out["host"], None, None)
+        
+    except Exception as exc:
+        out["success"] = False
+        out["error"] = str(exc)
+
+    return out
         
     # 这里必须有 except，才能和上面的 try 配对！
        except Exception as exc:
