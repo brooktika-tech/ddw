@@ -310,7 +310,7 @@ def classify_network(host, exit_org, is_datacenter=None):
 def check_one(node, session):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。"""
     base_url = "https://white-glitter-fb99.tmpbooktik.workers.dev/check"
-    url = f"{base_url}?proxyip={quote(f"{node['host']}:{node['port']}", safe='')}"
+    url = f"{base_url}?proxyip={quote(f'{node["host"]}:{node["port"]}', safe='')}"
     
     out = dict(node)
     out["protocol"] = "sstp"
